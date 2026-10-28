@@ -1,0 +1,50 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist_py/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# ===== PyInstaller / EXE build =====
+build/
+dist/
+*.spec
+*.exe
+*.exe.manifest
+
+# PyInstaller work files (if generated outside build/)
+warn-*.txt
+xref-*.html
+
+# ===== App runtime data (do not commit) =====
+# Lives under %APPDATA% on Windows, but ignore if someone runs from repo
+library.json
+covers/
+ra_badges/
+ra_icons/
+*.log
+
+# ===== IDE / OS =====
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# ===== Optional local secrets =====
+.env
+.env.*
+secrets.json

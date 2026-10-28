@@ -2180,16 +2180,44 @@ class LocalGameLibrary(tk.Tk):
             sys_lbl.place(relx=1.0, rely=0.0, anchor="ne", x=-6, y=5)
 
         # RA achievement progress overlay on cover
+        # In progress → white count
+        # Complete (all softcore) → green + tick
+        # Mastered (all hardcore) → gold + cup
         prog = game.get("ra_progress")
         if game.get("ra_game_id") and prog and prog.get("total"):
-            txt = f"{prog.get('awarded', 0)}/{prog.get('total', 0)}"
-            prog_lbl = tk.Label(
-                cover_frame, text=txt,
+            awarded = int(prog.get("awarded") or 0)
+            total = int(prog.get("total") or 0)
+            awarded_hc = int(prog.get("awarded_hc") or 0)
+            completed = total > 0 and awarded >= total
+            mastered = total > 0 and awarded_hc >= total
+
+            count_txt = f"{awarded}/{total}"
+            if mastered:
+                fg = "#fbbf24"          # gold
+                mark = "🏆"
+                mark_font = ("Segoe UI Emoji", 10)
+            elif completed:
+                fg = "#4ade80"          # green
+                mark = "✓"
+                mark_font = ("Segoe UI", 10, "bold")
+            else:
+                fg = "#f8fafc"          # white
+                mark = ""
+                mark_font = ("Segoe UI", 9, "bold")
+
+            prog_fr = tk.Frame(cover_frame, bg="#0f172a")
+            prog_fr.place(relx=0.0, rely=1.0, anchor="sw", x=6, y=-6)
+            tk.Label(
+                prog_fr, text=count_txt,
                 font=("Segoe UI", 9, "bold"),
-                bg="#0f172a", fg="#4ade80",
-                padx=6, pady=2
-            )
-            prog_lbl.place(relx=0.0, rely=1.0, anchor="sw", x=6, y=-6)
+                bg="#0f172a", fg=fg,
+            ).pack(side=tk.LEFT, padx=(6, 2 if mark else 6), pady=2)
+            if mark:
+                tk.Label(
+                    prog_fr, text=mark,
+                    font=mark_font,
+                    bg="#0f172a", fg=fg,
+                ).pack(side=tk.LEFT, padx=(0, 6), pady=2)
         elif game.get("ra_game_id"):
             # Linked but no progress cached yet — small RA mark
             ra_mark = tk.Label(
@@ -3428,11 +3456,18 @@ class LocalGameLibrary(tk.Tk):
             data = client.get_game_progress(int(ra_id))
             total = data.get("NumAchievements") or len(data.get("Achievements") or {})
             awarded = data.get("NumAwardedToUser") or 0
+            awarded_hc = data.get("NumAwardedToUserHardcore") or 0
             pct = data.get("UserCompletion") or "0%"
+            total_i = int(total) if total else 0
+            awarded_i = int(awarded)
+            awarded_hc_i = int(awarded_hc)
             progress = {
-                "awarded": int(awarded),
-                "total": int(total) if total else 0,
+                "awarded": awarded_i,
+                "awarded_hc": awarded_hc_i,
+                "total": total_i,
                 "pct": str(pct),
+                "mastered": total_i > 0 and awarded_i >= total_i,
+                "hc_mastered": total_i > 0 and awarded_hc_i >= total_i,
                 "icon": data.get("ImageIcon") or data.get("imageIcon") or "",
                 "boxart": data.get("ImageBoxArt") or data.get("imageBoxArt") or "",
                 "title": data.get("Title") or data.get("title") or "",
@@ -4169,10 +4204,17 @@ class LocalGameLibrary(tk.Tk):
                     if update_card_progress and self._progress_game_id(game) == int(set_id):
                         total = data.get("NumAchievements") or len(data.get("Achievements") or {})
                         awarded = data.get("NumAwardedToUser") or 0
+                        awarded_hc = data.get("NumAwardedToUserHardcore") or 0
+                        total_i = int(total) if total else 0
+                        awarded_i = int(awarded)
+                        awarded_hc_i = int(awarded_hc)
                         game["ra_progress"] = {
-                            "awarded": int(awarded),
-                            "total": int(total) if total else 0,
+                            "awarded": awarded_i,
+                            "awarded_hc": awarded_hc_i,
+                            "total": total_i,
                             "pct": str(data.get("UserCompletion") or "0%"),
+                            "mastered": total_i > 0 and awarded_i >= total_i,
+                            "hc_mastered": total_i > 0 and awarded_hc_i >= total_i,
                             "icon": data.get("ImageIcon") or "",
                             "boxart": data.get("ImageBoxArt") or "",
                             "title": data.get("Title") or "",
