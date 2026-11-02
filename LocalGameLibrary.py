@@ -99,6 +99,7 @@ def load_data() -> dict:
             for g in data:
                 g.setdefault("collections", [])
                 g.setdefault("launch_options", "")
+                g.setdefault("working_dir", "")
                 g.setdefault("ra_game_id", None)
                 g.setdefault("ra_display_set_id", None)
                 g.setdefault("cover_mode", "fill")
@@ -120,6 +121,7 @@ def load_data() -> dict:
         for g in data["games"]:
             g.setdefault("collections", [])
             g.setdefault("launch_options", "")
+            g.setdefault("working_dir", "")
             g.setdefault("ra_game_id", None)
             g.setdefault("ra_display_set_id", None)
             g.setdefault("cover_mode", "fill")
@@ -2437,24 +2439,46 @@ class LocalGameLibrary(tk.Tk):
         if path.suffix.lower() != ".lnk" or sys.platform != "win32":
             return str(path), "", str(path.parent)
 
-        # PowerShell COM is the most reliable way without extra packages
+        # Escape single quotes for PowerShell single-quoted string
+        lnk = str(path).replace("'", "''")
         ps = (
             "$ErrorActionPreference='Stop'; "
-            f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{str(path).replace(chr(39), chr(39)+chr(39))}'); "
-            "$o=[ordered]@{Target=$s.TargetPath; Args=$s.Arguments; Dir=$s.WorkingDirectory}; "
-            "$o | ConvertTo-Json -Compress"
+            f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); "
+            "$t = [string]$s.TargetPath; "
+            "$a = [string]$s.Arguments; "
+            "$d = [string]$s.WorkingDirectory; "
+            "Write-Output (('TARGET>>' + $t)); "
+            "Write-Output (('ARGS>>' + $a)); "
+            "Write-Output (('DIR>>' + $d)); "
         )
         try:
-            proc = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True, text=True, timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                data = json.loads(proc.stdout.strip())
-                target = (data.get("Target") or "").strip() or str(path)
-                args = (data.get("Args") or "").strip()
-                cwd = (data.get("Dir") or "").strip() or str(Path(target).parent)
+            # Prefer Windows PowerShell; fall back to pwsh if needed
+            for shell in ("powershell", "pwsh"):
+                try:
+                    proc = subprocess.run(
+                        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except FileNotFoundError:
+                    continue
+                if proc.returncode != 0 or not (proc.stdout or "").strip():
+                    continue
+                target, args, cwd = "", "", ""
+                for line in proc.stdout.splitlines():
+                    if line.startswith("TARGET>>"):
+                        target = line[8:].strip()
+                    elif line.startswith("ARGS>>"):
+                        args = line[6:].strip()
+                    elif line.startswith("DIR>>"):
+                        cwd = line[5:].strip()
+                if not target:
+                    continue
+                if not cwd:
+                    try:
+                        cwd = str(Path(target).parent)
+                    except Exception:
+                        cwd = str(path.parent)
                 return target, args, cwd
         except Exception:
             pass
@@ -2474,8 +2498,15 @@ class LocalGameLibrary(tk.Tk):
             return
 
         chosen_path = Path(chosen)
-        target, launch_args, _cwd = self._resolve_shortcut(chosen_path)
+        target, launch_args, work_dir = self._resolve_shortcut(chosen_path)
         exe_path = Path(target)
+
+        # If resolve failed and user picked a .lnk, keep the .lnk path and
+        # resolve again at launch time (more reliable for some emulators).
+        store_path = str(exe_path)
+        if chosen_path.suffix.lower() == ".lnk":
+            if not exe_path.exists() or exe_path.suffix.lower() == ".lnk":
+                store_path = str(chosen_path)
 
         # Default name from shortcut name, else exe stem
         default_name = chosen_path.stem if chosen_path.suffix.lower() == ".lnk" else exe_path.stem
@@ -2517,10 +2548,11 @@ class LocalGameLibrary(tk.Tk):
         game = {
             "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
             "name": name,
-            "path": str(exe_path),
+            "path": store_path,
             "cover": cover,
             "cover_mode": cover_mode,
             "launch_options": launch_args,
+            "working_dir": work_dir or "",
             "collections": [],
             "ra_game_id": None,
             "ra_display_set_id": None,
@@ -2780,53 +2812,131 @@ class LocalGameLibrary(tk.Tk):
             except Exception:
                 pass
 
+    @staticmethod
+    def _repair_exe_and_args(path_str: str, args: str) -> tuple[str, str]:
+        """
+        Fix corrupted library entries where path is:
+          C:\\emu\\app.exe"D:\\roms\\game.cue"
+        """
+        path_str = path_str or ""
+        args = (args or "").strip()
+        lower = path_str.lower()
+        marker = ".exe\""
+        idx = lower.find(marker)
+        if idx != -1:
+            exe = path_str[: idx + 4]
+            rest = path_str[idx + 4 :].strip().strip('"').strip()
+            if rest and not args:
+                args = rest
+            return exe, args
+        return path_str, args
+
     def launch_game(self, game: dict, as_admin: bool = False):
-        path = Path(game["path"])
-        if not path.exists():
-            messagebox.showerror("File not found",
-                                 f'The executable no longer exists:\n{path}')
-            return
+        """
+        Launch like the working v15 build: Windows cmd line with shell=True
+        so emulator ROM paths with spaces/quotes match double-clicking a .lnk.
+        """
+        path = Path(game.get("path") or "")
+        args = (game.get("launch_options") or "").strip()
+        cwd = (game.get("working_dir") or "").strip()
+        pid = None
+
         try:
-            args = game.get("launch_options", "").strip()
-            cwd = str(path.parent)
+            # Repair glued exe"rom" paths from older broken builds
+            fixed_path, fixed_args = self._repair_exe_and_args(str(path), args)
+            if fixed_path != str(path) or fixed_args != args:
+                path = Path(fixed_path)
+                args = fixed_args
+                game["path"] = fixed_path
+                game["launch_options"] = fixed_args
+                self._save()
+
+            # Prefer opening .lnk the same way Explorer does
+            if path.suffix.lower() == ".lnk" and path.exists() and sys.platform == "win32":
+                verb = "runas" if as_admin else "open"
+                ret = ctypes.windll.shell32.ShellExecuteW(
+                    None, verb, str(path), None, None, 1
+                )
+                if ret > 32:
+                    game["last_played"] = datetime.now().isoformat(timespec="seconds")
+                    if hasattr(self, "_start_play_session"):
+                        self._start_play_session(game, None)
+                    self._save()
+                    self.refresh_library()
+                    self.status_var.set(f'Launching “{game["name"]}”…')
+                    return
+                # else fall through and resolve
+
+            if path.suffix.lower() == ".lnk":
+                if not path.exists():
+                    messagebox.showerror(
+                        "File not found",
+                        f'The shortcut no longer exists:\n{path}',
+                    )
+                    return
+                target, lnk_args, lnk_cwd = self._resolve_shortcut(path)
+                path = Path(target)
+                if not args and lnk_args:
+                    args = lnk_args
+                if not cwd and lnk_cwd:
+                    cwd = lnk_cwd
+
+            if not path.exists():
+                messagebox.showerror(
+                    "File not found",
+                    f'The executable no longer exists:\n{path}',
+                )
+                return
+
+            if not cwd or not Path(cwd).is_dir():
+                cwd = str(path.parent)
+
             exe = str(path)
-            pid = None
+
             if sys.platform == "win32":
                 if as_admin:
                     ret = ctypes.windll.shell32.ShellExecuteW(
-                        None, "runas", exe, args if args else None, cwd, 1)
+                        None, "runas", exe, args if args else None, cwd, 1
+                    )
                     if ret <= 32:
                         raise RuntimeError(f"ShellExecute failed ({ret})")
-                    # ShellExecute does not return a PID we can track
                 else:
-                    # Prefer list form so we get a real process PID
-                    try:
-                        cmd = [exe] + (shlex.split(args, posix=False) if args else [])
-                    except Exception:
-                        cmd = [exe]
+                    # Same as the working older build: one command string + shell=True
+                    # so launch_options keep their original quoting (critical for ROMs).
+                    cmd_line = f'"{exe}" {args}' if args else f'"{exe}"'
                     CREATE_NEW_PROCESS_GROUP = 0x00000200
                     DETACHED_PROCESS = 0x00000008
                     startupinfo = subprocess.STARTUPINFO()
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     startupinfo.wShowWindow = 1
                     proc = subprocess.Popen(
-                        cmd, cwd=cwd, shell=False, startupinfo=startupinfo,
+                        cmd_line,
+                        cwd=cwd,
+                        shell=True,
+                        startupinfo=startupinfo,
                         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
                         close_fds=True,
                     )
-                    pid = proc.pid
+                    pid = getattr(proc, "pid", None)
             else:
                 cmd = [exe] + (args.split() if args else [])
                 proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
                 pid = proc.pid
+
             game["last_played"] = datetime.now().isoformat(timespec="seconds")
-            self._start_play_session(game, pid)
+            if cwd and not game.get("working_dir"):
+                game["working_dir"] = cwd
+            if hasattr(self, "_start_play_session"):
+                self._start_play_session(game, pid)
             self._save()
             self.refresh_library()
             self.status_var.set(f'Launching “{game["name"]}”…')
         except Exception as e:
-            messagebox.showerror("Launch failed",
-                                 f'Could not start “{game["name"]}”:\n\n{e}')
+            messagebox.showerror(
+                "Launch failed",
+                f'Could not start “{game.get("name", "game")}”:\n\n{e}',
+            )
+
 
     def set_launch_options(self, game: dict):
         current = game.get("launch_options", "")
