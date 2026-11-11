@@ -88,7 +88,11 @@ def load_data() -> dict:
         "games": [],
         "collections": [],
         "ra": {"username": "", "api_key": ""},
-        "settings": {"start_with_windows": False, "collapsed_collections": []},
+        "settings": {
+            "start_with_windows": False,
+            "collapsed_collections": [],
+            "ra_notifications": True,
+        },
     }
     if not LIBRARY_FILE.exists():
         return default
@@ -110,14 +114,23 @@ def load_data() -> dict:
                 "games": data,
                 "collections": [],
                 "ra": {"username": "", "api_key": ""},
-                "settings": {"start_with_windows": False, "collapsed_collections": []},
+                "settings": {
+                    "start_with_windows": False,
+                    "collapsed_collections": [],
+                    "ra_notifications": True,
+                },
             }
         data.setdefault("games", [])
         data.setdefault("collections", [])
         data.setdefault("ra", {"username": "", "api_key": ""})
-        data.setdefault("settings", {"start_with_windows": False, "collapsed_collections": []})
+        data.setdefault("settings", {
+            "start_with_windows": False,
+            "collapsed_collections": [],
+            "ra_notifications": True,
+        })
         data["settings"].setdefault("start_with_windows", False)
         data["settings"].setdefault("collapsed_collections", [])
+        data["settings"].setdefault("ra_notifications", True)
         for g in data["games"]:
             g.setdefault("collections", [])
             g.setdefault("launch_options", "")
@@ -198,6 +211,10 @@ def set_start_with_windows(enabled: bool) -> tuple[bool, str]:
 
 RA_API_BASE = "https://retroachievements.org/API"
 RA_MEDIA = "https://media.retroachievements.org"
+
+# Debug: unlock-notification tester (Settings → Test notification…)
+# Set to False to hide the UI, or delete everything marked  # [RA_NOTIF_DEBUG]
+RA_NOTIF_DEBUG = True
 
 
 class RAClient:
@@ -648,6 +665,44 @@ def short_system_name(name: str) -> str:
     return name[:9] + "…"
 
 
+def format_pct(awarded, total) -> str:
+    """Format completion percent with useful decimals (e.g. 12.5%, not 12.00%)."""
+    try:
+        awarded = float(awarded or 0)
+        total = float(total or 0)
+    except Exception:
+        return "0%"
+    if total <= 0:
+        return "0%"
+    pct = (awarded / total) * 100.0
+    if pct <= 0:
+        return "0%"
+    if pct >= 100:
+        return "100%"
+    # Up to 2 decimals, drop trailing zeros: 12.50 → 12.5, 12.00 → 12
+    s = f"{pct:.2f}".rstrip("0").rstrip(".")
+    return f"{s}%"
+
+
+def format_completion_str(value, awarded=None, total=None) -> str:
+    """Clean API strings like '12.00%' or compute from counts."""
+    if value is not None and str(value).strip():
+        raw = str(value).strip().replace("%", "").strip()
+        try:
+            pct = float(raw)
+            if pct <= 0:
+                return "0%"
+            if pct >= 100:
+                return "100%"
+            s = f"{pct:.2f}".rstrip("0").rstrip(".")
+            return f"{s}%"
+        except Exception:
+            pass
+    if awarded is not None and total is not None:
+        return format_pct(awarded, total)
+    return "0%"
+
+
 def format_playtime(seconds) -> str:
     """Human-readable playtime."""
     try:
@@ -954,6 +1009,12 @@ class LocalGameLibrary(tk.Tk):
         self._ra_badge_images = {}
         # Active play sessions: game_id -> {pid, start, game}
         self._play_sessions: dict = {}
+        # Live RA progress while playing: game_id -> last known (awarded, awarded_hc)
+        self._ra_live_last: dict = {}
+        # game_id -> set of earned achievement IDs (for detecting new unlocks)
+        self._ra_live_earned: dict = {}
+        self._ra_live_busy = False
+        self._ra_toast_photos: list = []  # keep PhotoImage refs alive
         self._icon_path = None
         self._icon_photo = None
         self._tray_icon = None
@@ -978,6 +1039,7 @@ class LocalGameLibrary(tk.Tk):
         # Defer first layout until the window is sized (esp. maximized)
         self.after(50, self._initial_layout)
         self.after(15000, self._poll_play_sessions)
+        self.after(3000, self._poll_ra_live)
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         if self._start_in_tray:
             # Hide immediately, then park in the tray once UI is ready
@@ -2596,7 +2658,21 @@ class LocalGameLibrary(tk.Tk):
             "pid": pid,
             "start": time.time(),
             "game": game,
+            "started_at": time.time(),
         }
+        # Seed live RA snapshot so the first poll can detect new unlocks
+        if game.get("ra_game_id"):
+            prog = game.get("ra_progress") or {}
+            self._ra_live_last[gid] = (
+                int(prog.get("awarded") or 0),
+                int(prog.get("awarded_hc") or 0),
+            )
+            # Seed immediately; ~1.5s poll loop shows unlocks as soon as RA has them
+            try:
+                self.after(400, lambda g=game: self._ra_live_check_one(g, notify=False, seed_only=True))
+                self.after(1500, lambda g=game: self._ra_live_check_one(g, notify=True))
+            except Exception:
+                pass
 
     def _end_play_session(self, gid: str):
         sess = self._play_sessions.pop(gid, None)
@@ -2606,6 +2682,14 @@ class LocalGameLibrary(tk.Tk):
         game = sess.get("game")
         if game is not None and elapsed > 0:
             game["playtime_seconds"] = int(game.get("playtime_seconds") or 0) + elapsed
+        # Final RA refresh when the session ends
+        if game is not None and game.get("ra_game_id"):
+            try:
+                self.after(500, lambda g=game: self._ra_live_check_one(g, notify=True))
+            except Exception:
+                pass
+        self._ra_live_last.pop(gid, None)
+        self._ra_live_earned.pop(gid, None)
 
     def _poll_play_sessions(self):
         """Accumulate playtime for running games; drop finished sessions."""
@@ -2619,22 +2703,422 @@ class LocalGameLibrary(tk.Tk):
                 finished.append(gid)
                 continue
             # If we have a PID, stop when process exits; otherwise keep
-            # accumulating while the launcher is open (best-effort).
-            alive = self._pid_alive(pid) if pid else True
+            # accumulating for a while (ShellExecute launches have no PID).
+            if pid:
+                alive = self._pid_alive(pid)
+            else:
+                # No PID: end after 6 hours max so sessions don't run forever
+                started = sess.get("started_at") or sess.get("start") or now
+                alive = (now - started) < 6 * 3600
             elapsed = max(0, int(now - sess["start"]))
             if elapsed > 0:
                 game["playtime_seconds"] = int(game.get("playtime_seconds") or 0) + elapsed
                 sess["start"] = now
                 changed = True
-            if pid and not alive:
+            if not alive:
                 finished.append(gid)
         for gid in finished:
-            self._play_sessions.pop(gid, None)
+            self._end_play_session(gid)
             changed = True
         if changed:
             self._save()
+            try:
+                self.refresh_library()
+            except Exception:
+                pass
         try:
             self.after(15000, self._poll_play_sessions)
+        except Exception:
+            pass
+
+    def _poll_ra_live(self):
+        """While games are running, poll RA about every 1.5s so toasts feel near-instant."""
+        try:
+            if self._really_quit:
+                return
+        except Exception:
+            pass
+        playing = any(
+            (s.get("game") or {}).get("ra_game_id")
+            for s in self._play_sessions.values()
+        )
+        if playing and not self._ra_live_busy:
+            for sess in list(self._play_sessions.values()):
+                g = sess.get("game")
+                if g and g.get("ra_game_id"):
+                    self._ra_live_check_one(g, notify=True)
+                    break  # one request at a time keeps API + UI light
+        try:
+            self.after(1500 if playing else 30000, self._poll_ra_live)
+        except Exception:
+            pass
+
+    def _ra_live_check_one(self, game: dict, notify: bool = False, seed_only: bool = False):
+        """Fetch RA progress; toast only on new unlocks. Skip disk/UI work if unchanged."""
+        if not game or not game.get("ra_game_id"):
+            return
+        client = self._ra_client()
+        if not client:
+            return
+        if self._ra_live_busy and not seed_only:
+            return
+        gid = game.get("id")
+        try:
+            ra_id = int(self._progress_game_id(game) if hasattr(self, "_progress_game_id") else game.get("ra_game_id"))
+        except Exception:
+            return
+
+        def work():
+            self._ra_live_busy = True
+            try:
+                data = client.get_game_progress(ra_id)
+                if not data:
+                    return
+
+                awarded = int(data.get("NumAwardedToUser") or 0)
+                awarded_hc = int(data.get("NumAwardedToUserHardcore") or 0)
+                prev_counts = self._ra_live_last.get(gid)
+                counts_changed = prev_counts != (awarded, awarded_hc)
+
+                achievements = data.get("Achievements") or {}
+                earned_now = set()
+                # Only keep full dicts for earned ones (less work later)
+                earned_map = {}
+                for key, ach in achievements.items():
+                    if not isinstance(ach, dict):
+                        continue
+                    try:
+                        aid = int(ach.get("ID") or ach.get("id") or key)
+                    except Exception:
+                        continue
+                    if ach.get("DateEarned") or ach.get("dateEarned") or ach.get("DateEarnedHardcore") or ach.get("dateEarnedHardcore"):
+                        earned_now.add(aid)
+                        earned_map[aid] = ach
+
+                prev_earned = self._ra_live_earned.get(gid)
+
+                # Seed: remember current unlocks, no toast spam
+                if prev_earned is None or seed_only:
+                    self._ra_live_earned[gid] = earned_now
+                    if counts_changed:
+                        self._apply_ra_progress_cache(game, data, ra_id, awarded, awarded_hc)
+                        self._ra_live_last[gid] = (awarded, awarded_hc)
+                        self._save()
+                        self.after(0, self.refresh_library)
+                    else:
+                        self._ra_live_last[gid] = (awarded, awarded_hc)
+                    return
+
+                new_ids = earned_now - prev_earned
+                self._ra_live_earned[gid] = earned_now
+                self._ra_live_last[gid] = (awarded, awarded_hc)
+
+                if not new_ids and not counts_changed:
+                    return  # nothing new — skip save + full UI rebuild
+
+                self._apply_ra_progress_cache(game, data, ra_id, awarded, awarded_hc)
+                self._save()
+
+                new_achs = [earned_map[i] for i in new_ids if i in earned_map]
+                new_achs.sort(
+                    key=lambda a: (
+                        a.get("DateEarnedHardcore") or a.get("dateEarnedHardcore")
+                        or a.get("DateEarned") or a.get("dateEarned") or ""
+                    ),
+                    reverse=True,
+                )
+
+                def ui():
+                    try:
+                        self.refresh_library()
+                    except Exception:
+                        pass
+                    if notify and new_achs:
+                        show_toast = bool(self.settings.get("ra_notifications", True))
+                        if show_toast:
+                            try:
+                                players_casual = int(
+                                    data.get("NumDistinctPlayersCasual")
+                                    or data.get("NumDistinctPlayers")
+                                    or 0
+                                )
+                            except Exception:
+                                players_casual = 0
+                            try:
+                                players_hc = int(
+                                    data.get("NumDistinctPlayersHardcore") or 0
+                                )
+                            except Exception:
+                                players_hc = 0
+                            for i, ach in enumerate(new_achs[:3]):
+                                payload = self._achievement_toast_payload(
+                                    ach,
+                                    players_casual=players_casual,
+                                    players_hardcore=players_hc,
+                                )
+                                self.after(i * 5200, lambda p=payload: self._show_live_ra_toast(p))
+                        try:
+                            t = new_achs[0].get("Title") or new_achs[0].get("title") or "Achievement"
+                            self.status_var.set(f"🏆 {t}" if show_toast else f"Unlocked: {t}")
+                        except Exception:
+                            pass
+
+                self.after(0, ui)
+            except Exception:
+                pass
+            finally:
+                self._ra_live_busy = False
+
+        threading.Thread(target=work, daemon=True, name="RALive").start()
+
+    @staticmethod
+    def _apply_ra_progress_cache(game: dict, data: dict, ra_id: int, awarded: int, awarded_hc: int):
+        total_i = int(data.get("NumAchievements") or len(data.get("Achievements") or {}) or 0)
+        game["ra_progress"] = {
+            "awarded": awarded,
+            "awarded_hc": awarded_hc,
+            "total": total_i,
+            "pct": str(data.get("UserCompletion") or "0%"),
+            "mastered": total_i > 0 and awarded >= total_i,
+            "hc_mastered": total_i > 0 and awarded_hc >= total_i,
+            "icon": data.get("ImageIcon") or "",
+            "boxart": data.get("ImageBoxArt") or "",
+            "title": data.get("Title") or "",
+            "console": data.get("ConsoleName") or data.get("Console") or "",
+            "set_id": int(ra_id),
+        }
+
+    @staticmethod
+    def _achievement_toast_payload(
+        ach: dict,
+        players_casual: int | float | None = None,
+        players_hardcore: int | float | None = None,
+    ) -> dict:
+        """
+        Normalize RA achievement fields for the unlock toast.
+        Unlock rate = players who earned it / distinct players for that mode.
+        Do NOT use TrueRatio — that is weighted points, not a percentage.
+        """
+        title = ach.get("Title") or ach.get("title") or "Achievement"
+        desc = ach.get("Description") or ach.get("description") or ""
+        badge = ach.get("BadgeName") or ach.get("badgeName") or ""
+        points = ach.get("Points") or ach.get("points") or 0
+
+        try:
+            num_sc = int(ach.get("NumAwarded") or 0)
+        except Exception:
+            num_sc = 0
+        try:
+            num_hc = int(ach.get("NumAwardedHardcore") or 0)
+        except Exception:
+            num_hc = 0
+
+        is_hc = bool(
+            ach.get("DateEarnedHardcore") or ach.get("dateEarnedHardcore")
+        )
+        try:
+            pc = int(players_casual or 0)
+        except Exception:
+            pc = 0
+        try:
+            ph = int(players_hardcore or 0)
+        except Exception:
+            ph = 0
+
+        rare_txt = ""
+        rate = None
+        # Prefer hardcore unlock rate when the unlock was hardcore
+        if is_hc and ph > 0:
+            rate = (num_hc / ph) * 100.0
+        elif pc > 0:
+            rate = (num_sc / pc) * 100.0
+        elif ph > 0:
+            rate = (num_hc / ph) * 100.0
+
+        if rate is not None:
+            if rate <= 0:
+                rare_txt = "0%"
+            elif rate >= 100:
+                rare_txt = "100%"
+            else:
+                # e.g. 2.10%, 12.5%, 0.12% — no trailing zeros
+                s = f"{rate:.2f}".rstrip("0").rstrip(".")
+                rare_txt = f"{s}%"
+        elif points:
+            rare_txt = f"{points} pts"
+
+        return {
+            "title": str(title),
+            "description": str(desc),
+            "badge": str(badge),
+            "rarity": rare_txt,
+            "points": points,
+        }
+
+    def _show_live_ra_toast(self, payload):
+        """
+        Unlock notification matching the RA-style card:
+        [Badge]  trophy Achievement Unlocked
+                 Title                    0.12%
+                 Description
+        """
+        if isinstance(payload, str):
+            payload = {"title": payload, "description": "", "badge": "", "rarity": ""}
+        title = payload.get("title") or "Achievement"
+        desc = payload.get("description") or ""
+        badge = payload.get("badge") or ""
+        rarity = payload.get("rarity") or ""
+
+        try:
+            toast = tk.Toplevel(self)
+            toast.overrideredirect(True)
+            toast.attributes("-topmost", True)
+            toast.configure(bg="#0b1220")
+            try:
+                toast.attributes("-alpha", 0.98)
+            except Exception:
+                pass
+
+            outer = tk.Frame(
+                toast, bg="#1a2332",
+                highlightthickness=1, highlightbackground="#3b82f6",
+            )
+            outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+            body = tk.Frame(outer, bg="#1a2332")
+            body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # Left: achievement badge
+            icon_size = 72
+            icon_fr = tk.Frame(
+                body, bg="#0f172a", width=icon_size, height=icon_size,
+                highlightthickness=1, highlightbackground="#2d3a4f",
+            )
+            icon_fr.pack(side=tk.LEFT, padx=(0, 12))
+            icon_fr.pack_propagate(False)
+            icon_lbl = tk.Label(
+                icon_fr, text="🏆", font=("Segoe UI Emoji", 28),
+                bg="#0f172a", fg="#fbbf24",
+            )
+            icon_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+            # Right: text column
+            text_fr = tk.Frame(body, bg="#1a2332")
+            text_fr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            header = tk.Frame(text_fr, bg="#1a2332")
+            header.pack(fill=tk.X)
+            tk.Label(
+                header, text="🏆  Achievement Unlocked",
+                font=("Segoe UI", 9),
+                bg="#1a2332", fg="#94a3b8",
+            ).pack(side=tk.LEFT)
+
+            title_row = tk.Frame(text_fr, bg="#1a2332")
+            title_row.pack(fill=tk.X, pady=(4, 0))
+            tk.Label(
+                title_row, text=title,
+                font=("Segoe UI", 12, "bold"),
+                bg="#1a2332", fg="#f8fafc",
+                anchor="w",
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if rarity:
+                tk.Label(
+                    title_row, text=rarity,
+                    font=("Segoe UI", 10, "bold"),
+                    bg="#1a2332", fg="#fbbf24",
+                    anchor="e",
+                ).pack(side=tk.RIGHT, padx=(8, 0))
+
+            # Underline under title (like the sketch)
+            tk.Frame(text_fr, bg="#334155", height=1).pack(fill=tk.X, pady=(4, 6))
+
+            # Toast width; description uses the full text column
+            tw = 460
+            # body padx 10*2 + icon + gap + outer border ≈ 10+10+72+12+4
+            desc_wrap = max(200, tw - (icon_size + 12 + 28))
+
+            if desc:
+                tk.Label(
+                    text_fr, text=desc,
+                    font=("Segoe UI", 9),
+                    bg="#1a2332", fg="#94a3b8",
+                    wraplength=desc_wrap, justify="left", anchor="nw",
+                ).pack(fill=tk.X, expand=True)
+
+            # Load badge image async
+            if badge:
+                def load_badge(b=badge, lbl=icon_lbl):
+                    try:
+                        url = f"{RA_MEDIA}/Badge/{b}.png"
+                        data_b = fetch_image_bytes(url, timeout=10)
+                        if not data_b:
+                            return
+                        photo = photo_from_bytes(data_b, size=icon_size - 8)
+                        if not photo:
+                            return
+                        self._ra_toast_photos.append(photo)
+
+                        def apply(p=photo, l=lbl):
+                            try:
+                                l.configure(image=p, text="")
+                            except Exception:
+                                pass
+                        self.after(0, apply)
+                    except Exception:
+                        pass
+                threading.Thread(target=load_badge, daemon=True).start()
+
+            # Size to content (capped so bad reqheight can't shove it off-screen)
+            toast.update_idletasks()
+            th = max(96, min(200, int(outer.winfo_reqheight() or 120) + 4))
+            tw = max(380, min(520, int(outer.winfo_reqwidth() or tw) + 4))
+
+            # Bottom-right of the Windows *work area* (excludes taskbar)
+            margin = 20
+            sx = sy = None
+            if sys.platform == "win32":
+                try:
+                    class _RECT(ctypes.Structure):
+                        _fields_ = [
+                            ("left", ctypes.c_long),
+                            ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long),
+                        ]
+                    work = _RECT()
+                    if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):
+                        sx = int(work.right) - tw - margin
+                        sy = int(work.bottom) - th - margin
+                except Exception:
+                    sx = sy = None
+            if sx is None or sy is None:
+                try:
+                    sw = int(toast.winfo_screenwidth())
+                    sh = int(toast.winfo_screenheight())
+                except Exception:
+                    sw, sh = 1920, 1080
+                sx = sw - tw - margin
+                sy = sh - th - margin - 48
+            sx = max(0, int(sx))
+            sy = max(0, int(sy))
+            toast.geometry(f"{tw}x{th}+{sx}+{sy}")
+            try:
+                toast.lift()
+                toast.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            def close():
+                try:
+                    toast.destroy()
+                except Exception:
+                    pass
+
+            toast.after(5000, close)
+            toast.bind("<Button-1>", lambda e: close())
+            for w in (outer, body, text_fr, icon_fr, icon_lbl):
+                w.bind("<Button-1>", lambda e: close())
         except Exception:
             pass
 
@@ -2991,12 +3475,256 @@ class LocalGameLibrary(tk.Tk):
         else:
             self.ra_btn.configure(bg="#7c3aed", fg="white", text="  🏆  RA Login  ")
 
+    # ----- [RA_NOTIF_DEBUG] begin — remove this whole method when done debugging -----
+    def debug_pick_test_achievement(self, status_lbl=None):
+        """Debug: pick a linked game + achievement, then show the unlock toast."""
+        if not RA_NOTIF_DEBUG:
+            return
+        client = self._ra_client()
+        if not client:
+            messagebox.showinfo(
+                "Test notification",
+                "Sign in to RetroAchievements first (RA button).",
+            )
+            return
+        linked = [g for g in self.games if g.get("ra_game_id")]
+        if not linked:
+            messagebox.showinfo(
+                "Test notification",
+                "Link at least one game to RetroAchievements first.",
+            )
+            return
+
+        picker = tk.Toplevel(self)
+        picker.title("Test notification — pick achievement")
+        picker.geometry("520x520")
+        picker.minsize(440, 420)
+        picker.configure(bg=Theme.SURFACE)
+        picker.transient(self)
+        picker.grab_set()
+        try:
+            self.update_idletasks()
+            px = self.winfo_rootx() + (self.winfo_width() - 520) // 2
+            py = self.winfo_rooty() + (self.winfo_height() - 520) // 2
+            picker.geometry(f"+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            pass
+
+        body = tk.Frame(picker, bg=Theme.SURFACE)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+
+        tk.Label(
+            body, text="Debug unlock toast",
+            font=("Segoe UI", 13, "bold"),
+            bg=Theme.SURFACE, fg=Theme.TEXT,
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text="Choose a linked game, then an achievement to preview the notification.",
+            font=("Segoe UI", 9), bg=Theme.SURFACE, fg=Theme.TEXT_MUTED,
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(2, 10))
+
+        # Game selector
+        tk.Label(body, text="Game", font=("Segoe UI", 9, "bold"),
+                 bg=Theme.SURFACE, fg=Theme.TEXT).pack(anchor="w")
+        game_names = [g.get("name") or f"Game {g.get('ra_game_id')}" for g in linked]
+        game_var = tk.StringVar(value=game_names[0])
+        game_menu = tk.OptionMenu(body, game_var, *game_names)
+        game_menu.configure(
+            bg=Theme.SURFACE2, fg=Theme.TEXT, activebackground=Theme.ACCENT,
+            activeforeground="white", highlightthickness=0, relief="flat",
+            font=("Segoe UI", 10),
+        )
+        game_menu["menu"].configure(
+            bg=Theme.SURFACE2, fg=Theme.TEXT,
+            activebackground=Theme.ACCENT, activeforeground="white",
+        )
+        game_menu.pack(fill=tk.X, pady=(2, 10))
+
+        # Search filter
+        tk.Label(body, text="Filter achievements", font=("Segoe UI", 9, "bold"),
+                 bg=Theme.SURFACE, fg=Theme.TEXT).pack(anchor="w")
+        filter_var = tk.StringVar()
+        filt_wrap = tk.Frame(body, bg=Theme.SURFACE2, highlightthickness=1,
+                             highlightbackground=Theme.BORDER)
+        filt_wrap.pack(fill=tk.X, pady=(2, 8))
+        filter_entry = tk.Entry(
+            filt_wrap, textvariable=filter_var,
+            bg=Theme.SURFACE2, fg=Theme.TEXT, insertbackground=Theme.TEXT,
+            relief="flat", font=("Segoe UI", 10),
+        )
+        filter_entry.pack(fill=tk.X, ipady=6, padx=8)
+
+        # Achievement list
+        list_fr = tk.Frame(body, bg=Theme.SURFACE)
+        list_fr.pack(fill=tk.BOTH, expand=True)
+        lb = tk.Listbox(
+            list_fr, bg=Theme.SURFACE2, fg=Theme.TEXT,
+            selectbackground=Theme.ACCENT, selectforeground="white",
+            relief="flat", font=("Segoe UI", 10), activestyle="none",
+            highlightthickness=1, highlightbackground=Theme.BORDER,
+        )
+        sb = tk.Scrollbar(list_fr, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        state = {
+            "achs": [],       # list of achievement dicts currently shown
+            "all_achs": [],   # full list for current game
+            "data": None,     # last API payload (for player counts)
+            "loading": False,
+        }
+        status = tk.Label(body, text="", font=("Segoe UI", 9),
+                          bg=Theme.SURFACE, fg=Theme.TEXT_MUTED)
+        status.pack(anchor="w", pady=(6, 0))
+
+        def current_game():
+            name = game_var.get()
+            for g, n in zip(linked, game_names):
+                if n == name:
+                    return g
+            return linked[0]
+
+        def refill_list():
+            q = (filter_var.get() or "").strip().lower()
+            lb.delete(0, tk.END)
+            state["achs"] = []
+            for ach in state["all_achs"]:
+                title = ach.get("Title") or ach.get("title") or "?"
+                if q and q not in title.lower() and q not in (ach.get("Description") or "").lower():
+                    continue
+                pts = ach.get("Points") or ach.get("points") or 0
+                earned = bool(ach.get("DateEarned") or ach.get("DateEarnedHardcore"))
+                mark = "✓ " if earned else "· "
+                lb.insert(tk.END, f"{mark}{title}  ({pts} pts)")
+                state["achs"].append(ach)
+            status.configure(
+                text=f"{len(state['achs'])} achievement(s)" + (f"  ·  filter “{q}”" if q else ""),
+                fg=Theme.TEXT_MUTED,
+            )
+
+        def load_game_achs():
+            if state["loading"]:
+                return
+            game = current_game()
+            state["loading"] = True
+            status.configure(text="Loading achievements…", fg=Theme.ACCENT)
+            lb.delete(0, tk.END)
+            state["achs"] = []
+            state["all_achs"] = []
+
+            def work():
+                try:
+                    ra_id = (
+                        self._progress_game_id(game)
+                        if hasattr(self, "_progress_game_id")
+                        else game.get("ra_game_id")
+                    )
+                    data = client.get_game_progress(int(ra_id))
+                    achs = []
+                    for a in (data.get("Achievements") or {}).values():
+                        if isinstance(a, dict):
+                            achs.append(a)
+                    achs.sort(
+                        key=lambda a: (
+                            a.get("DisplayOrder") or a.get("displayOrder") or 0,
+                            a.get("ID") or a.get("id") or 0,
+                        )
+                    )
+                    state["data"] = data
+                    state["all_achs"] = achs
+
+                    def ui():
+                        state["loading"] = False
+                        refill_list()
+                    self.after(0, ui)
+                except Exception as e:
+                    err = str(e)
+                    def ui_err():
+                        state["loading"] = False
+                        status.configure(text=f"Error: {err}", fg=Theme.DANGER)
+                    self.after(0, ui_err)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_game_change(*_):
+            load_game_achs()
+
+        game_var.trace_add("write", on_game_change)
+        filter_var.trace_add("write", lambda *_: refill_list())
+
+        def fire_selected():
+            sel = lb.curselection()
+            if not sel:
+                status.configure(text="Select an achievement first.", fg=Theme.DANGER)
+                return
+            ach = state["achs"][sel[0]]
+            data = state["data"] or {}
+            try:
+                pc = int(data.get("NumDistinctPlayersCasual") or data.get("NumDistinctPlayers") or 0)
+            except Exception:
+                pc = 0
+            try:
+                ph = int(data.get("NumDistinctPlayersHardcore") or 0)
+            except Exception:
+                ph = 0
+            # Force hardcore-style rate if HC earned (for realistic % in debug)
+            payload = self._achievement_toast_payload(
+                ach, players_casual=pc, players_hardcore=ph
+            )
+            self._show_live_ra_toast(payload)
+            title = payload.get("title") or "Achievement"
+            status.configure(text=f"Shown: {title}", fg=Theme.SUCCESS)
+            if status_lbl is not None:
+                try:
+                    status_lbl.configure(text=f"Test toast: {title}", fg=Theme.ACCENT)
+                except Exception:
+                    pass
+
+        def fire_sample():
+            self._show_live_ra_toast({
+                "title": "Sample Achievement",
+                "description": "This is a local sample — no RA data required.",
+                "badge": "",
+                "rarity": "2.1%",
+                "points": 5,
+            })
+            status.configure(text="Shown sample toast", fg=Theme.SUCCESS)
+
+        btn_row = tk.Frame(body, bg=Theme.SURFACE)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(
+            btn_row, text="Show selected", font=("Segoe UI", 10, "bold"),
+            bg=Theme.ACCENT, fg="white", relief="flat", cursor="hand2",
+            padx=12, pady=6, command=fire_selected,
+            activebackground=Theme.ACCENT_HOV, activeforeground="white",
+        ).pack(side=tk.RIGHT)
+        tk.Button(
+            btn_row, text="Sample toast", font=("Segoe UI", 10),
+            bg=Theme.SURFACE2, fg=Theme.TEXT, relief="flat", cursor="hand2",
+            padx=12, pady=6, command=fire_sample,
+            activebackground=Theme.BORDER, activeforeground=Theme.TEXT,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Button(
+            btn_row, text="Close", font=("Segoe UI", 10),
+            bg=Theme.SURFACE2, fg=Theme.TEXT_MUTED, relief="flat", cursor="hand2",
+            padx=12, pady=6, command=picker.destroy,
+            activebackground=Theme.BORDER, activeforeground=Theme.TEXT,
+        ).pack(side=tk.LEFT)
+
+        lb.bind("<Double-Button-1>", lambda e: fire_selected())
+        picker.bind("<Escape>", lambda e: picker.destroy())
+        load_game_achs()
+    # ----- [RA_NOTIF_DEBUG] end ------------------------------------------------
+
     def show_app_settings(self):
-        """App settings: Start with Windows (opens in system tray)."""
+        """App settings: startup tray + RA notifications."""
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("460x280")
-        win.minsize(400, 240)
+        win.geometry("460x430")
+        win.minsize(400, 360)
         win.configure(bg=Theme.SURFACE)
         win.transient(self)
         win.grab_set()
@@ -3004,7 +3732,7 @@ class LocalGameLibrary(tk.Tk):
         try:
             self.update_idletasks()
             px = self.winfo_rootx() + (self.winfo_width() - 460) // 2
-            py = self.winfo_rooty() + (self.winfo_height() - 280) // 2
+            py = self.winfo_rooty() + (self.winfo_height() - 430) // 2
             win.geometry(f"+{max(0, px)}+{max(0, py)}")
         except Exception:
             pass
@@ -3016,7 +3744,7 @@ class LocalGameLibrary(tk.Tk):
                  bg=Theme.SURFACE, fg=Theme.TEXT).pack(anchor="w")
         tk.Label(
             body,
-            text="Startup and system tray options",
+            text="Startup, tray, and RetroAchievements",
             font=("Segoe UI", 9),
             bg=Theme.SURFACE,
             fg=Theme.TEXT_MUTED,
@@ -3059,9 +3787,61 @@ class LocalGameLibrary(tk.Tk):
             justify="left",
         ).pack(anchor="w", pady=(4, 0))
 
+        # RA unlock notifications
+        notif_default = self.settings.get("ra_notifications", True)
+        if notif_default is None:
+            notif_default = True
+        notif_var = tk.BooleanVar(value=bool(notif_default))
+        row2 = tk.Frame(body, bg=Theme.SURFACE2, highlightthickness=1,
+                        highlightbackground=Theme.BORDER)
+        row2.pack(fill=tk.X, pady=(0, 8))
+        inner2 = tk.Frame(row2, bg=Theme.SURFACE2)
+        inner2.pack(fill=tk.X, padx=12, pady=12)
+        cb_notif = tk.Checkbutton(
+            inner2,
+            text="Achievement unlock notifications",
+            variable=notif_var,
+            bg=Theme.SURFACE2,
+            fg=Theme.TEXT,
+            selectcolor=Theme.SURFACE,
+            activebackground=Theme.SURFACE2,
+            activeforeground=Theme.TEXT,
+            font=("Segoe UI", 11, "bold"),
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        cb_notif.pack(anchor="w")
+        tk.Label(
+            inner2,
+            text="Show a toast when you unlock a RetroAchievements achievement\n"
+                 "while playing from this library. Progress on the card still updates.",
+            font=("Segoe UI", 9),
+            bg=Theme.SURFACE2,
+            fg=Theme.TEXT_MUTED,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
         status = tk.Label(body, text="", bg=Theme.SURFACE, fg=Theme.TEXT_MUTED,
                           font=("Segoe UI", 9), justify="left")
         status.pack(anchor="w", pady=(8, 0))
+
+        # [RA_NOTIF_DEBUG] — set RA_NOTIF_DEBUG = False (or delete this block) to hide
+        if RA_NOTIF_DEBUG:
+            tk.Button(
+                inner2, text="Test notification…",
+                font=("Segoe UI", 9, "bold"),
+                bg=Theme.ACCENT, fg="white", relief="flat", cursor="hand2",
+                padx=10, pady=4,
+                command=lambda: self.debug_pick_test_achievement(status),
+                activebackground=Theme.ACCENT_HOV, activeforeground="white",
+            ).pack(anchor="w", pady=(10, 0))
+            tk.Label(
+                inner2,
+                text="Debug: pick any achievement from a linked game to preview the toast.",
+                font=("Segoe UI", 8),
+                bg=Theme.SURFACE2,
+                fg=Theme.TEXT_MUTED,
+            ).pack(anchor="w", pady=(4, 0))
 
         if not HAS_PYSTRAY:
             status.configure(
@@ -3080,9 +3860,11 @@ class LocalGameLibrary(tk.Tk):
                 status.configure(text=msg, fg=Theme.DANGER)
                 return
             self.settings["start_with_windows"] = want
+            self.settings["ra_notifications"] = bool(notif_var.get())
             self._save()
-            status.configure(text=msg, fg=Theme.SUCCESS if want else Theme.TEXT_MUTED)
-            self.status_var.set(msg)
+            extra = " · Notifications on" if self.settings["ra_notifications"] else " · Notifications off"
+            status.configure(text=msg + extra, fg=Theme.SUCCESS if want else Theme.TEXT_MUTED)
+            self.status_var.set("Settings saved")
 
         def close():
             win.destroy()
@@ -4151,11 +4933,16 @@ class LocalGameLibrary(tk.Tk):
             num = data.get("NumAchievements") or len(data.get("Achievements") or {})
             awarded = data.get("NumAwardedToUser") or 0
             awarded_hc = data.get("NumAwardedToUserHardcore") or 0
-            completion = data.get("UserCompletion") or "0%"
+            completion = format_completion_str(
+                data.get("UserCompletion"), awarded, num
+            )
+            hc_completion = format_completion_str(
+                data.get("UserCompletionHardcore"), awarded_hc, num
+            )
             _set_title_text(title)
             # Two-line progress so it never collides with the title
             progress_lbl.configure(
-                text=f"{awarded}/{num}  ({completion})\nHC: {awarded_hc}"
+                text=f"{awarded}/{num}  ({completion})\nHC: {awarded_hc}/{num}  ({hc_completion})"
             )
             update_card_btn()
             achievements = data.get("Achievements") or {}
