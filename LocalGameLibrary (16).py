@@ -2955,6 +2955,73 @@ class LocalGameLibrary(tk.Tk):
             "points": points,
         }
 
+    @staticmethod
+    def _toast_screen_anchor(tw: int, th: int, margin: int = 24) -> tuple[int, int]:
+        """
+        Bottom-right of the usable desktop area on the monitor under the mouse
+        (falls back to primary). Never uses the app window position.
+        """
+        sx = sy = None
+        if sys.platform == "win32":
+            try:
+                class _RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long),
+                    ]
+
+                class _POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                class _MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", ctypes.c_ulong),
+                        ("rcMonitor", _RECT),
+                        ("rcWork", _RECT),
+                        ("dwFlags", ctypes.c_ulong),
+                    ]
+
+                user32 = ctypes.windll.user32
+                pt = _POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                # MONITOR_DEFAULTTONEAREST = 2
+                hmon = user32.MonitorFromPoint(pt, 2)
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if hmon and user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    work = mi.rcWork
+                    sx = int(work.right) - tw - margin
+                    sy = int(work.bottom) - th - margin
+                    # Clamp inside this monitor's work area
+                    sx = max(int(work.left) + margin, min(sx, int(work.right) - tw - margin))
+                    sy = max(int(work.top) + margin, min(sy, int(work.bottom) - th - margin))
+                else:
+                    # Primary work area
+                    work = _RECT()
+                    if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):
+                        sx = int(work.right) - tw - margin
+                        sy = int(work.bottom) - th - margin
+            except Exception:
+                sx = sy = None
+
+        if sx is None or sy is None:
+            try:
+                # Last resort: Tk screen size (primary)
+                root = tk._default_root
+                if root is not None:
+                    sw = int(root.winfo_screenwidth())
+                    sh = int(root.winfo_screenheight())
+                else:
+                    sw, sh = 1920, 1080
+            except Exception:
+                sw, sh = 1920, 1080
+            sx = sw - tw - margin
+            sy = sh - th - margin - 48
+
+        return max(0, int(sx)), max(0, int(sy))
+
     def _show_live_ra_toast(self, payload):
         """
         Unlock notification matching the RA-style card:
@@ -3074,40 +3141,23 @@ class LocalGameLibrary(tk.Tk):
             th = max(96, min(200, int(outer.winfo_reqheight() or 120) + 4))
             tw = max(380, min(520, int(outer.winfo_reqwidth() or tw) + 4))
 
-            # Bottom-right of the Windows *work area* (excludes taskbar)
-            margin = 20
-            sx = sy = None
-            if sys.platform == "win32":
+            # Pin to bottom-right of the monitor under the cursor (or primary).
+            # Independent of the app window so it works from tray / other desktops.
+            margin = 24
+            sx, sy = self._toast_screen_anchor(tw, th, margin)
+
+            def _place(x=sx, y=sy, w=tw, h=th):
                 try:
-                    class _RECT(ctypes.Structure):
-                        _fields_ = [
-                            ("left", ctypes.c_long),
-                            ("top", ctypes.c_long),
-                            ("right", ctypes.c_long),
-                            ("bottom", ctypes.c_long),
-                        ]
-                    work = _RECT()
-                    if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):
-                        sx = int(work.right) - tw - margin
-                        sy = int(work.bottom) - th - margin
+                    toast.geometry(f"{w}x{h}+{x}+{y}")
+                    toast.lift()
+                    toast.attributes("-topmost", True)
                 except Exception:
-                    sx = sy = None
-            if sx is None or sy is None:
-                try:
-                    sw = int(toast.winfo_screenwidth())
-                    sh = int(toast.winfo_screenheight())
-                except Exception:
-                    sw, sh = 1920, 1080
-                sx = sw - tw - margin
-                sy = sh - th - margin - 48
-            sx = max(0, int(sx))
-            sy = max(0, int(sy))
-            toast.geometry(f"{tw}x{th}+{sx}+{sy}")
-            try:
-                toast.lift()
-                toast.attributes("-topmost", True)
-            except Exception:
-                pass
+                    pass
+
+            _place()
+            # overrideredirect windows sometimes ignore the first geometry set
+            toast.after(30, _place)
+            toast.after(120, _place)
 
             def close():
                 try:
@@ -3723,22 +3773,13 @@ class LocalGameLibrary(tk.Tk):
         """App settings: startup tray + RA notifications."""
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("460x430")
-        win.minsize(400, 360)
         win.configure(bg=Theme.SURFACE)
         win.transient(self)
         win.grab_set()
         win.resizable(False, False)
-        try:
-            self.update_idletasks()
-            px = self.winfo_rootx() + (self.winfo_width() - 460) // 2
-            py = self.winfo_rooty() + (self.winfo_height() - 430) // 2
-            win.geometry(f"+{max(0, px)}+{max(0, py)}")
-        except Exception:
-            pass
 
         body = tk.Frame(win, bg=Theme.SURFACE)
-        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+        body.pack(fill=tk.X, padx=24, pady=(20, 0))
 
         tk.Label(body, text="Settings", font=("Segoe UI", 14, "bold"),
                  bg=Theme.SURFACE, fg=Theme.TEXT).pack(anchor="w")
@@ -3869,8 +3910,8 @@ class LocalGameLibrary(tk.Tk):
         def close():
             win.destroy()
 
-        btn_row = tk.Frame(body, bg=Theme.SURFACE)
-        btn_row.pack(fill=tk.X, pady=(20, 0))
+        btn_row = tk.Frame(win, bg=Theme.SURFACE)
+        btn_row.pack(fill=tk.X, padx=24, pady=(12, 18))
         tk.Button(
             btn_row, text="  Save  ", font=("Segoe UI", 10, "bold"),
             bg=Theme.ACCENT, fg="white", relief="flat", cursor="hand2",
@@ -3886,6 +3927,17 @@ class LocalGameLibrary(tk.Tk):
 
         win.bind("<Escape>", lambda e: close())
         win.bind("<Return>", lambda e: save())
+
+        # Size tightly to content (no large empty gap)
+        win.update_idletasks()
+        w = max(420, win.winfo_reqwidth())
+        h = win.winfo_reqheight()
+        try:
+            px = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            py = self.winfo_rooty() + (self.winfo_height() - h) // 2
+            win.geometry(f"{w}x{h}+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
 
     def show_ra_settings(self):
         win = tk.Toplevel(self)
